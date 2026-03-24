@@ -9,7 +9,7 @@ from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 
 class ProcessingMode(Enum):
@@ -56,6 +56,7 @@ class LogProcessorConfig:
     anomaly_sensitivity: float = 2.5
     entropy_decay_factor: float = 0.95
     temporal_window_seconds: int = 3600
+    max_anomaly_history: int = 10000
 
 
 class SlidingWindowEntropy:
@@ -186,6 +187,11 @@ class PatternDetector:
     
     def reset(self) -> None:
         with self._lock:
+            self._pattern_stats = {name: Counter() for name in self._patterns}
+    
+    def clear_patterns(self) -> None:
+        with self._lock:
+            self._patterns.clear()
             self._pattern_stats.clear()
 
 
@@ -384,76 +390,77 @@ class AdvancedLogProcessor:
         self._temporal_analyzer = TemporalPatternAnalyzer(time_window_seconds=self.config.temporal_window_seconds)
         self._event_buffer: deque = deque(maxlen=self.config.event_buffer_size)
         self._correlation_groups: Dict[str, List[Dict[str, Any]]] = {}
-        self._anomaly_history: List[AnomalyReport] = []
+        self._anomaly_history: deque = deque(maxlen=self.config.max_anomaly_history)
         
         patterns_to_register = patterns or self.DEFAULT_PATTERNS
         for name, pattern in patterns_to_register.items():
             self._pattern_detector.register_pattern(name, pattern)
     
     def process_line(self, line: str, timestamp: Optional[float] = None) -> Dict[str, Any]:
-        if timestamp is None:
-            timestamp = time.time()
-        
-        if not isinstance(line, str):
-            raise TypeError("line must be a string")
-        
-        line_length = len(line)
-        word_count = len(line.split()) if line.strip() else 0
-        pattern_matches = self._pattern_detector.scan_line(line)
-        
-        event_signature = self._extract_event_signature(line, pattern_matches)
-        self._event_distribution_entropy.update(event_signature)
-        raw_entropy = self._event_distribution_entropy.entropy
-        self._smoothed_entropy.update(raw_entropy)
-        
-        self._temporal_analyzer.record(timestamp, line_length)
-        
-        anomaly, z_score = self._threshold_monitor.test_anomaly(line_length)
-        
-        self._threshold_monitor.update_baseline(line_length)
-        
-        event = {
-            'timestamp': timestamp,
-            'line': line,
-            'length': line_length,
-            'word_count': word_count,
-            'patterns': pattern_matches,
-            'raw_entropy': raw_entropy,
-            'smoothed_entropy': self._smoothed_entropy.entropy,
-            'is_anomaly': anomaly,
-            'anomaly_score': z_score,
-            'correlation_id': None
-        }
-        
-        self._event_buffer.append(event)
-        
-        if anomaly:
-            correlation_id = self._correlate_event(event)
-            event['correlation_id'] = correlation_id
+        with self._lock:
+            if timestamp is None:
+                timestamp = time.time()
             
-            severity = AnomalySeverity.CRITICAL if z_score > 5 else (
-                AnomalySeverity.HIGH if z_score > 4 else (
-                    AnomalySeverity.MEDIUM if z_score > 3 else AnomalySeverity.LOW
+            if not isinstance(line, str):
+                raise TypeError("line must be a string")
+            
+            line_length = len(line)
+            word_count = len(line.split()) if line.strip() else 0
+            pattern_matches = self._pattern_detector.scan_line(line)
+            
+            event_signature = self._extract_event_signature(line, pattern_matches)
+            self._event_distribution_entropy.update(event_signature)
+            raw_entropy = self._event_distribution_entropy.entropy
+            self._smoothed_entropy.update(raw_entropy)
+            
+            self._temporal_analyzer.record(timestamp, line_length)
+            
+            anomaly, z_score = self._threshold_monitor.test_anomaly(line_length)
+            
+            self._threshold_monitor.update_baseline(line_length)
+            
+            event = {
+                'timestamp': timestamp,
+                'line': line,
+                'length': line_length,
+                'word_count': word_count,
+                'patterns': pattern_matches,
+                'raw_entropy': raw_entropy,
+                'smoothed_entropy': self._smoothed_entropy.entropy,
+                'is_anomaly': anomaly,
+                'anomaly_score': z_score,
+                'correlation_id': None
+            }
+            
+            self._event_buffer.append(event)
+            
+            if anomaly:
+                correlation_id = self._correlate_event(event)
+                event['correlation_id'] = correlation_id
+                
+                severity = AnomalySeverity.CRITICAL if z_score > 5 else (
+                    AnomalySeverity.HIGH if z_score > 4 else (
+                        AnomalySeverity.MEDIUM if z_score > 3 else AnomalySeverity.LOW
+                    )
                 )
-            )
+                
+                anomaly_report = AnomalyReport(
+                    timestamp=datetime.fromtimestamp(timestamp),
+                    severity=severity,
+                    anomaly_type='length_anomaly',
+                    description=f"Line length {line_length} deviates from baseline (z-score: {z_score:.2f})",
+                    context={
+                        'line_preview': line[:200],
+                        'z_score': z_score,
+                        'matched_patterns': [p for p, m in pattern_matches.items() if m],
+                        'line_length': line_length,
+                        'correlation_id': correlation_id
+                    },
+                    correlation_id=correlation_id
+                )
+                self._anomaly_history.append(anomaly_report)
             
-            anomaly_report = AnomalyReport(
-                timestamp=datetime.fromtimestamp(timestamp),
-                severity=severity,
-                anomaly_type='length_anomaly',
-                description=f"Line length {line_length} deviates from baseline (z-score: {z_score:.2f})",
-                context={
-                    'line_preview': line[:200],
-                    'z_score': z_score,
-                    'matched_patterns': [p for p, m in pattern_matches.items() if m],
-                    'line_length': line_length,
-                    'correlation_id': correlation_id
-                },
-                correlation_id=correlation_id
-            )
-            self._anomaly_history.append(anomaly_report)
-        
-        return event
+            return event
     
     def _extract_event_signature(self, line: str, pattern_matches: Dict[str, bool]) -> str:
         if not line.strip():
@@ -464,13 +471,15 @@ class AdvancedLogProcessor:
             return f"pattern:{','.join(matched_patterns)}"
         
         words = line.split()
-        if len(words) == 1:
-            return f"type:{words[0][:50]}"
+        if not words:
+            return "type:unknown"
         
         if words[0].startswith('['):
-            return f"type:{words[0]}"
+            if len(words) > 1:
+                return f"type:{words[1][:50]}"
+            return "type:timestamped_unknown"
         
-        return f"type:{words[0]}"
+        return f"type:{words[0][:50]}"
     
     def _correlate_event(self, event: Dict[str, Any]) -> str:
         current_time = event['timestamp']
@@ -482,34 +491,46 @@ class AdvancedLogProcessor:
         correlation_key = patterns[0]
         cutoff = current_time - self.config.correlation_window_seconds
         
-        with self._lock:
-            if correlation_key in self._correlation_groups:
-                filtered = [
-                    e for e in self._correlation_groups[correlation_key]
-                    if e['timestamp'] > cutoff
-                ]
-                
-                if filtered:
-                    self._correlation_groups[correlation_key] = filtered
-                    return filtered[0]['correlation_id']
-                else:
-                    del self._correlation_groups[correlation_key]
+        if correlation_key in self._correlation_groups:
+            filtered = [
+                e for e in self._correlation_groups[correlation_key]
+                if e['timestamp'] > cutoff
+            ]
             
-            correlation_id = str(uuid.uuid4())
-            self._correlation_groups[correlation_key] = [{
-                'timestamp': current_time,
-                'correlation_id': correlation_id,
-                'patterns': patterns
-            }]
-            
-            return correlation_id
+            if filtered:
+                self._correlation_groups[correlation_key] = filtered
+                return filtered[0]['correlation_id']
+            else:
+                del self._correlation_groups[correlation_key]
+        
+        correlation_id = str(uuid.uuid4())
+        self._correlation_groups[correlation_key] = [{
+            'timestamp': current_time,
+            'correlation_id': correlation_id,
+            'patterns': patterns
+        }]
+        
+        return correlation_id
     
     def get_window_statistics(self, window_seconds: int = 300) -> WindowStatistics:
         if window_seconds <= 0:
             raise ValueError("window_seconds must be positive")
         
-        cutoff = time.time() - window_seconds
-        window_events = [e for e in self._event_buffer if e['timestamp'] > cutoff]
+        with self._lock:
+            if not self._event_buffer:
+                return WindowStatistics(
+                    start_index=0,
+                    end_index=0,
+                    duration_seconds=0,
+                    event_counts={},
+                    entropy=0.0,
+                    sample_events=[],
+                    anomaly_flags=[]
+                )
+            
+            reference_time = self._event_buffer[-1]['timestamp']
+            cutoff = reference_time - window_seconds
+            window_events = [e for e in self._event_buffer if e['timestamp'] > cutoff]
         
         if not window_events:
             return WindowStatistics(
@@ -567,7 +588,7 @@ class AdvancedLogProcessor:
             raise ValueError("limit must be positive")
         
         with self._lock:
-            return self._anomaly_history[-limit:]
+            return list(self._anomaly_history)[-limit:]
     
     def get_comprehensive_report(self) -> Dict[str, Any]:
         with self._lock:
@@ -637,7 +658,7 @@ class TimestampSimulator:
 
 class DataStreamSimulator:
     def __init__(self, seed: int = 42):
-        random.seed(seed)
+        self._rng = random.Random(seed)
         self._event_types = [
             'INFO: User action completed',
             'WARNING: Slow query detected',
@@ -660,14 +681,14 @@ class DataStreamSimulator:
             p = math.exp(-lam)
             k = 0
             s = p
-            u = random.random()
+            u = self._rng.random()
             while u > s:
                 k += 1
                 p *= lam / k
                 s += p
             return k
         else:
-            return int(random.gauss(lam, math.sqrt(lam)) + 0.5)
+            return int(self._rng.gauss(lam, math.sqrt(lam)) + 0.5)
     
     def generate_events(
         self,
@@ -680,7 +701,6 @@ class DataStreamSimulator:
         if events_per_second <= 0:
             raise ValueError("events_per_second must be positive")
         
-        start_offset = 0
         end_offset = duration_seconds
         current_offset = 0
         event_counter = 0
@@ -696,12 +716,12 @@ class DataStreamSimulator:
             events_this_second = self._poisson(rate * events_per_second)
             
             for _ in range(events_this_second):
-                if random.random() < 0.1:
-                    event_type = random.choice(self._event_types)
+                if self._rng.random() < 0.1:
+                    event_type = self._rng.choice(self._event_types)
                 else:
-                    event_type = random.choice(self._event_types[:5])
+                    event_type = self._rng.choice(self._event_types[:5])
                 
-                if random.random() < 0.05:
+                if self._rng.random() < 0.05:
                     event_type = event_type.replace('INFO', 'ERROR')
                 
                 if use_simulator:
@@ -711,8 +731,8 @@ class DataStreamSimulator:
                 
                 log_line = f"[{datetime.fromtimestamp(timestamp).isoformat()}] {event_type} (request_id={uuid.uuid4()})"
                 
-                if random.random() < 0.02:
-                    log_line += " with additional context data that is unusually long " + "x" * random.randint(100, 500)
+                if self._rng.random() < 0.02:
+                    log_line += " with additional context data that is unusually long " + "x" * self._rng.randint(100, 500)
                 
                 yield timestamp, log_line
                 event_counter += 1
@@ -744,19 +764,19 @@ class DataStreamSimulator:
             events_this_second = self._poisson(rate * events_per_second)
             
             for _ in range(events_this_second):
-                if random.random() < 0.1:
-                    event_type = random.choice(self._event_types)
+                if self._rng.random() < 0.1:
+                    event_type = self._rng.choice(self._event_types)
                 else:
-                    event_type = random.choice(self._event_types[:5])
+                    event_type = self._rng.choice(self._event_types[:5])
                 
-                if random.random() < 0.05:
+                if self._rng.random() < 0.05:
                     event_type = event_type.replace('INFO', 'ERROR')
                 
-                timestamp = base_time + second_offset + (random.random() * 0.999)
+                timestamp = base_time + second_offset + (self._rng.random() * 0.999)
                 log_line = f"[{datetime.fromtimestamp(timestamp).isoformat()}] {event_type} (request_id={uuid.uuid4()})"
                 
-                if random.random() < 0.02:
-                    log_line += " with additional context data that is unusually long " + "x" * random.randint(100, 500)
+                if self._rng.random() < 0.02:
+                    log_line += " with additional context data that is unusually long " + "x" * self._rng.randint(100, 500)
                 
                 yield timestamp, log_line
                 event_counter += 1
@@ -789,12 +809,12 @@ def demonstrate_advanced_processing():
     config = LogProcessorConfig(
         correlation_window_seconds=30,
         event_buffer_size=5000,
-        processing_mode=ProcessingMode.HYBRID
+        processing_mode=ProcessingMode.HYBRID,
+        max_anomaly_history=1000
     )
     
     processor = AdvancedLogProcessor(config=config)
     simulator = DataStreamSimulator()
-    timestamp_sim = TimestampSimulator(start_time=1700000000.0, speed_factor=100.0)
     
     print("\n[1] Simulating data stream with anomalies (fast mode)...")
     events_processed = 0
