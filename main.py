@@ -2,13 +2,14 @@ import json
 import math
 import random
 import re
+import threading
 import time
+import uuid
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, Generator, List, Optional, Tuple
-import uuid
+from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 
 class ProcessingMode(Enum):
@@ -45,27 +46,43 @@ class WindowStatistics:
     anomaly_flags: List[AnomalyReport]
 
 
+@dataclass
+class LogProcessorConfig:
+    correlation_window_seconds: int = 60
+    event_buffer_size: int = 10000
+    processing_mode: ProcessingMode = ProcessingMode.HYBRID
+    entropy_window_size: int = 500
+    baseline_window: int = 200
+    anomaly_sensitivity: float = 2.5
+    entropy_decay_factor: float = 0.95
+    temporal_window_seconds: int = 3600
+
+
 class SlidingWindowEntropy:
     def __init__(self, window_size: int = 1000):
+        if window_size <= 0:
+            raise ValueError("window_size must be positive")
         self.window_size = window_size
+        self._lock = threading.Lock()
         self._buffer: deque = deque(maxlen=window_size)
         self._counter: Counter = Counter()
         self._total_count = 0
         self._current_entropy = 0.0
     
     def update(self, value: Any) -> None:
-        if len(self._buffer) == self.window_size:
-            oldest = self._buffer[0]
-            old_count = self._counter[oldest]
-            self._counter[oldest] = old_count - 1
-            if self._counter[oldest] == 0:
-                del self._counter[oldest]
-            self._total_count -= 1
-        
-        self._buffer.append(value)
-        self._counter[value] += 1
-        self._total_count += 1
-        self._recalculate_entropy()
+        with self._lock:
+            if len(self._buffer) == self.window_size:
+                oldest = self._buffer.popleft()
+                old_count = self._counter[oldest]
+                self._counter[oldest] = old_count - 1
+                if self._counter[oldest] == 0:
+                    del self._counter[oldest]
+                self._total_count -= 1
+            
+            self._buffer.append(value)
+            self._counter[value] += 1
+            self._total_count += 1
+            self._recalculate_entropy()
     
     def _recalculate_entropy(self) -> None:
         if self._total_count == 0:
@@ -82,82 +99,106 @@ class SlidingWindowEntropy:
     
     @property
     def entropy(self) -> float:
-        return self._current_entropy
+        with self._lock:
+            return self._current_entropy
     
     @property
     def unique_values(self) -> int:
-        return len(self._counter)
+        with self._lock:
+            return len(self._counter)
     
     def reset(self) -> None:
-        self._buffer.clear()
-        self._counter.clear()
-        self._total_count = 0
-        self._current_entropy = 0.0
+        with self._lock:
+            self._buffer.clear()
+            self._counter.clear()
+            self._total_count = 0
+            self._current_entropy = 0.0
 
 
 class ExponentialSmoothingEntropy:
     def __init__(self, decay_factor: float = 0.95):
+        if not 0 < decay_factor < 1:
+            raise ValueError("decay_factor must be between 0 and 1")
         self.decay_factor = decay_factor
+        self._lock = threading.Lock()
         self._current_entropy = 0.0
         self._initialized = False
     
     def update(self, raw_entropy: float) -> None:
-        if not self._initialized:
-            self._current_entropy = raw_entropy
-            self._initialized = True
-        else:
-            self._current_entropy = (self._current_entropy * self.decay_factor) + (raw_entropy * (1 - self.decay_factor))
+        with self._lock:
+            if not self._initialized:
+                self._current_entropy = raw_entropy
+                self._initialized = True
+            else:
+                self._current_entropy = (self._current_entropy * self.decay_factor) + (raw_entropy * (1 - self.decay_factor))
     
     @property
     def entropy(self) -> float:
-        return self._current_entropy
+        with self._lock:
+            return self._current_entropy
     
     def reset(self) -> None:
-        self._current_entropy = 0.0
-        self._initialized = False
+        with self._lock:
+            self._current_entropy = 0.0
+            self._initialized = False
 
 
 class PatternDetector:
     def __init__(self):
+        self._lock = threading.Lock()
         self._patterns: Dict[str, re.Pattern] = {}
         self._pattern_stats: Dict[str, Counter] = {}
     
     def register_pattern(self, name: str, pattern: str, flags: int = re.IGNORECASE) -> None:
-        self._patterns[name] = re.compile(pattern, flags)
-        self._pattern_stats[name] = Counter()
+        with self._lock:
+            self._patterns[name] = re.compile(pattern, flags)
+            self._pattern_stats[name] = Counter()
     
     def scan_line(self, line: str) -> Dict[str, bool]:
         results = {}
-        for name, pattern in self._patterns.items():
-            match = pattern.search(line)
-            results[name] = match is not None
-            if match:
-                self._pattern_stats[name][match.group(0)] += 1
+        with self._lock:
+            for name, pattern in self._patterns.items():
+                match = pattern.search(line)
+                results[name] = match is not None
+                if match:
+                    self._pattern_stats[name][match.group(0)] += 1
         return results
     
     def get_frequent_matches(self, pattern_name: str, limit: int = 10) -> List[Tuple[str, int]]:
-        if pattern_name not in self._pattern_stats:
-            return []
-        return self._pattern_stats[pattern_name].most_common(limit)
+        with self._lock:
+            if pattern_name not in self._pattern_stats:
+                return []
+            return self._pattern_stats[pattern_name].most_common(limit)
     
     def get_pattern_statistics(self) -> Dict[str, Dict[str, Any]]:
         stats = {}
-        for name, counter in self._pattern_stats.items():
-            total_matches = sum(counter.values())
-            unique_matches = len(counter)
-            stats[name] = {
-                'total_matches': total_matches,
-                'unique_matches': unique_matches,
-                'most_common': counter.most_common(5),
-                'diversity_ratio': unique_matches / total_matches if total_matches > 0 else 0
-            }
+        with self._lock:
+            for name, counter in self._pattern_stats.items():
+                total_matches = sum(counter.values())
+                unique_matches = len(counter)
+                stats[name] = {
+                    'total_matches': total_matches,
+                    'unique_matches': unique_matches,
+                    'most_common': counter.most_common(5),
+                    'diversity_ratio': unique_matches / total_matches if total_matches > 0 else 0
+                }
         return stats
+    
+    def reset(self) -> None:
+        with self._lock:
+            self._pattern_stats.clear()
 
 
 class AdaptiveThresholdMonitor:
     def __init__(self, baseline_window: int = 100, sensitivity: float = 2.0):
+        if baseline_window <= 0:
+            raise ValueError("baseline_window must be positive")
+        if sensitivity <= 0:
+            raise ValueError("sensitivity must be positive")
+        
         self.baseline_window = baseline_window
         self.sensitivity = sensitivity
+        self._lock = threading.Lock()
         self._values: deque = deque(maxlen=baseline_window * 2)
         self._baseline_mean = 0.0
         self._baseline_variance = 0.0
@@ -165,22 +206,24 @@ class AdaptiveThresholdMonitor:
         self._is_calibrated = False
     
     def test_anomaly(self, value: float) -> Tuple[bool, float]:
-        if not self._is_calibrated:
-            return False, 0.0
-        
-        deviation = abs(value - self._baseline_mean)
-        z_score = deviation / self._baseline_std if self._baseline_std > 0 else 0.0
-        is_anomalous = z_score > self.sensitivity
-        
-        return is_anomalous, z_score
+        with self._lock:
+            if not self._is_calibrated:
+                return False, 0.0
+            
+            deviation = abs(value - self._baseline_mean)
+            z_score = deviation / self._baseline_std if self._baseline_std > 0 else 0.0
+            is_anomalous = z_score > self.sensitivity
+            
+            return is_anomalous, z_score
     
     def update_baseline(self, value: float) -> None:
-        self._values.append(value)
-        
-        if len(self._values) >= self.baseline_window and not self._is_calibrated:
-            self._calibrate()
-        elif self._is_calibrated:
-            self._update_baseline_ewma(value)
+        with self._lock:
+            self._values.append(value)
+            
+            if len(self._values) >= self.baseline_window and not self._is_calibrated:
+                self._calibrate()
+            elif self._is_calibrated:
+                self._update_baseline_ewma(value)
     
     def _calibrate(self) -> None:
         recent = list(self._values)[-self.baseline_window:]
@@ -199,136 +242,163 @@ class AdaptiveThresholdMonitor:
     
     @property
     def baseline(self) -> Tuple[float, float]:
-        return self._baseline_mean, self._baseline_std
+        with self._lock:
+            return self._baseline_mean, self._baseline_std
     
     @property
     def calibrated(self) -> bool:
-        return self._is_calibrated
+        with self._lock:
+            return self._is_calibrated
     
     def reset(self) -> None:
-        self._values.clear()
-        self._baseline_mean = 0.0
-        self._baseline_variance = 0.0
-        self._baseline_std = 0.0
-        self._is_calibrated = False
+        with self._lock:
+            self._values.clear()
+            self._baseline_mean = 0.0
+            self._baseline_variance = 0.0
+            self._baseline_std = 0.0
+            self._is_calibrated = False
 
 
 class TemporalPatternAnalyzer:
     def __init__(self, time_window_seconds: int = 3600):
+        if time_window_seconds <= 0:
+            raise ValueError("time_window_seconds must be positive")
+        
         self.time_window = time_window_seconds
+        self._lock = threading.Lock()
         self._timestamps: deque = deque()
         self._values: deque = deque()
     
     def record(self, timestamp: float, value: float) -> None:
-        self._timestamps.append(timestamp)
-        self._values.append(value)
-        
-        cutoff = timestamp - self.time_window
-        while self._timestamps and self._timestamps[0] < cutoff:
-            self._timestamps.popleft()
-            self._values.popleft()
+        with self._lock:
+            self._timestamps.append(timestamp)
+            self._values.append(value)
+            
+            cutoff = timestamp - self.time_window
+            while self._timestamps and self._timestamps[0] < cutoff:
+                self._timestamps.popleft()
+                self._values.popleft()
     
     def detect_arrival_regularity(self, min_occurrences: int = 3) -> Dict[str, Any]:
-        if len(self._timestamps) < min_occurrences:
-            return {'regular': False, 'reason': 'insufficient data'}
-        
-        intervals = []
-        for i in range(1, len(self._timestamps)):
-            interval = self._timestamps[i] - self._timestamps[i-1]
-            intervals.append(interval)
-        
-        if not intervals:
-            return {'regular': False, 'reason': 'no intervals'}
-        
-        avg_interval = sum(intervals) / len(intervals)
-        variance = sum((i - avg_interval) ** 2 for i in intervals) / len(intervals)
-        std_dev = math.sqrt(variance)
-        coefficient_of_variation = std_dev / avg_interval if avg_interval > 0 else 1.0
-        regularity = 1.0 - min(1.0, coefficient_of_variation)
-        
-        is_regular = regularity > 0.7 and len(intervals) >= min_occurrences
-        
-        return {
-            'regular': is_regular,
-            'average_interval': avg_interval,
-            'regularity_score': regularity,
-            'observed_intervals': len(intervals),
-            'interval_std_dev': std_dev,
-            'coefficient_of_variation': coefficient_of_variation
-        }
+        with self._lock:
+            if len(self._timestamps) < min_occurrences:
+                return {'regular': False, 'reason': 'insufficient data'}
+            
+            intervals = []
+            for i in range(1, len(self._timestamps)):
+                interval = self._timestamps[i] - self._timestamps[i-1]
+                intervals.append(interval)
+            
+            if not intervals:
+                return {'regular': False, 'reason': 'no intervals'}
+            
+            avg_interval = sum(intervals) / len(intervals)
+            variance = sum((i - avg_interval) ** 2 for i in intervals) / len(intervals)
+            std_dev = math.sqrt(variance)
+            coefficient_of_variation = std_dev / avg_interval if avg_interval > 0 else 1.0
+            regularity = 1.0 - min(1.0, coefficient_of_variation)
+            
+            is_regular = regularity > 0.7 and len(intervals) >= min_occurrences
+            
+            return {
+                'regular': is_regular,
+                'average_interval': avg_interval,
+                'regularity_score': regularity,
+                'observed_intervals': len(intervals),
+                'interval_std_dev': std_dev,
+                'coefficient_of_variation': coefficient_of_variation
+            }
     
     def get_trend(self) -> Dict[str, Any]:
-        if len(self._values) < 2:
-            return {'trend_detected': False}
-        
-        n = len(self._values)
-        x_sum = sum(range(n))
-        y_sum = sum(self._values)
-        xy_sum = sum(i * v for i, v in enumerate(self._values))
-        x2_sum = sum(i * i for i in range(n))
-        
-        denominator = (n * x2_sum - x_sum * x_sum)
-        if denominator == 0:
-            return {'trend_detected': False}
-        
-        slope = (n * xy_sum - x_sum * y_sum) / denominator
-        intercept = (y_sum - slope * x_sum) / n
-        
-        predicted = [slope * i + intercept for i in range(n)]
-        residuals = [self._values[i] - predicted[i] for i in range(n)]
-        mse = sum(r * r for r in residuals) / n
-        rmse = math.sqrt(mse)
-        
-        if slope > 0:
-            direction = "increasing"
-        elif slope < 0:
-            direction = "decreasing"
-        else:
-            direction = "stable"
-        
-        return {
-            'trend_detected': True,
-            'slope': slope,
-            'intercept': intercept,
-            'rmse': rmse,
-            'direction': direction,
-            'strength': min(1.0, abs(slope) / (abs(slope) + rmse)) if rmse > 0 else 1.0
-        }
+        with self._lock:
+            if len(self._values) < 2:
+                return {'trend_detected': False}
+            
+            n = len(self._values)
+            x_sum = sum(range(n))
+            y_sum = sum(self._values)
+            xy_sum = sum(i * v for i, v in enumerate(self._values))
+            x2_sum = sum(i * i for i in range(n))
+            
+            denominator = (n * x2_sum - x_sum * x_sum)
+            if denominator == 0:
+                return {'trend_detected': False}
+            
+            slope = (n * xy_sum - x_sum * y_sum) / denominator
+            intercept = (y_sum - slope * x_sum) / n
+            
+            predicted = [slope * i + intercept for i in range(n)]
+            residuals = [self._values[i] - predicted[i] for i in range(n)]
+            mse = sum(r * r for r in residuals) / n
+            rmse = math.sqrt(mse)
+            
+            if slope > 0:
+                direction = "increasing"
+            elif slope < 0:
+                direction = "decreasing"
+            else:
+                direction = "stable"
+            
+            return {
+                'trend_detected': True,
+                'slope': slope,
+                'intercept': intercept,
+                'rmse': rmse,
+                'direction': direction,
+                'strength': min(1.0, abs(slope) / (abs(slope) + rmse)) if rmse > 0 else 1.0
+            }
+    
+    def reset(self) -> None:
+        with self._lock:
+            self._timestamps.clear()
+            self._values.clear()
 
 
 class AdvancedLogProcessor:
+    DEFAULT_PATTERNS = {
+        'error': r'ERROR|FATAL|CRITICAL',
+        'warning': r'WARNING|WARN',
+        'exception': r'Exception|Traceback|Stack trace',
+        'timeout': r'timeout|timed out',
+        'connection': r'connection|disconnect|reconnect',
+        'authentication': r'auth|login|password|token',
+        'database': r'database|db|sql|query',
+        'memory': r'memory|heap|allocation'
+    }
+    
     def __init__(
         self,
-        correlation_window_seconds: int = 60,
-        event_buffer_size: int = 10000,
-        processing_mode: ProcessingMode = ProcessingMode.HYBRID
+        config: Optional[LogProcessorConfig] = None,
+        patterns: Optional[Dict[str, str]] = None
     ):
-        self.correlation_window = correlation_window_seconds
-        self.processing_mode = processing_mode
+        self.config = config or LogProcessorConfig()
+        self._lock = threading.Lock()
+        
         self._pattern_detector = PatternDetector()
-        self._event_distribution_entropy = SlidingWindowEntropy(window_size=500)
-        self._smoothed_entropy = ExponentialSmoothingEntropy(decay_factor=0.95)
-        self._threshold_monitor = AdaptiveThresholdMonitor(baseline_window=200, sensitivity=2.5)
-        self._temporal_analyzer = TemporalPatternAnalyzer(time_window_seconds=3600)
-        self._event_buffer: deque = deque(maxlen=event_buffer_size)
+        self._event_distribution_entropy = SlidingWindowEntropy(window_size=self.config.entropy_window_size)
+        self._smoothed_entropy = ExponentialSmoothingEntropy(decay_factor=self.config.entropy_decay_factor)
+        self._threshold_monitor = AdaptiveThresholdMonitor(
+            baseline_window=self.config.baseline_window,
+            sensitivity=self.config.anomaly_sensitivity
+        )
+        self._temporal_analyzer = TemporalPatternAnalyzer(time_window_seconds=self.config.temporal_window_seconds)
+        self._event_buffer: deque = deque(maxlen=self.config.event_buffer_size)
         self._correlation_groups: Dict[str, List[Dict[str, Any]]] = {}
         self._anomaly_history: List[AnomalyReport] = []
         
-        self._pattern_detector.register_pattern('error', r'ERROR|FATAL|CRITICAL')
-        self._pattern_detector.register_pattern('warning', r'WARNING|WARN')
-        self._pattern_detector.register_pattern('exception', r'Exception|Traceback|Stack trace')
-        self._pattern_detector.register_pattern('timeout', r'timeout|timed out')
-        self._pattern_detector.register_pattern('connection', r'connection|disconnect|reconnect')
-        self._pattern_detector.register_pattern('authentication', r'auth|login|password|token')
-        self._pattern_detector.register_pattern('database', r'database|db|sql|query')
-        self._pattern_detector.register_pattern('memory', r'memory|heap|allocation')
+        patterns_to_register = patterns or self.DEFAULT_PATTERNS
+        for name, pattern in patterns_to_register.items():
+            self._pattern_detector.register_pattern(name, pattern)
     
     def process_line(self, line: str, timestamp: Optional[float] = None) -> Dict[str, Any]:
         if timestamp is None:
             timestamp = time.time()
         
+        if not isinstance(line, str):
+            raise TypeError("line must be a string")
+        
         line_length = len(line)
-        word_count = len(line.split())
+        word_count = len(line.split()) if line.strip() else 0
         pattern_matches = self._pattern_detector.scan_line(line)
         
         event_signature = self._extract_event_signature(line, pattern_matches)
@@ -361,9 +431,15 @@ class AdvancedLogProcessor:
             correlation_id = self._correlate_event(event)
             event['correlation_id'] = correlation_id
             
+            severity = AnomalySeverity.CRITICAL if z_score > 5 else (
+                AnomalySeverity.HIGH if z_score > 4 else (
+                    AnomalySeverity.MEDIUM if z_score > 3 else AnomalySeverity.LOW
+                )
+            )
+            
             anomaly_report = AnomalyReport(
                 timestamp=datetime.fromtimestamp(timestamp),
-                severity=AnomalySeverity.MEDIUM if z_score > 3 else AnomalySeverity.LOW,
+                severity=severity,
                 anomaly_type='length_anomaly',
                 description=f"Line length {line_length} deviates from baseline (z-score: {z_score:.2f})",
                 context={
@@ -380,15 +456,21 @@ class AdvancedLogProcessor:
         return event
     
     def _extract_event_signature(self, line: str, pattern_matches: Dict[str, bool]) -> str:
+        if not line.strip():
+            return "type:empty_line"
+        
         matched_patterns = [p for p, matched in pattern_matches.items() if matched]
         if matched_patterns:
             return f"pattern:{','.join(matched_patterns)}"
         
         words = line.split()
-        if len(words) >= 2:
-            return f"type:{words[0] if words[0].startswith('[') else words[1] if len(words) > 1 else words[0]}"
+        if len(words) == 1:
+            return f"type:{words[0][:50]}"
         
-        return "type:unknown"
+        if words[0].startswith('['):
+            return f"type:{words[0]}"
+        
+        return f"type:{words[0]}"
     
     def _correlate_event(self, event: Dict[str, Any]) -> str:
         current_time = event['timestamp']
@@ -398,27 +480,34 @@ class AdvancedLogProcessor:
             return str(uuid.uuid4())
         
         correlation_key = patterns[0]
-        cutoff = current_time - self.correlation_window
+        cutoff = current_time - self.config.correlation_window_seconds
         
-        if correlation_key in self._correlation_groups:
-            self._correlation_groups[correlation_key] = [
-                e for e in self._correlation_groups[correlation_key]
-                if e['timestamp'] > cutoff
-            ]
+        with self._lock:
+            if correlation_key in self._correlation_groups:
+                filtered = [
+                    e for e in self._correlation_groups[correlation_key]
+                    if e['timestamp'] > cutoff
+                ]
+                
+                if filtered:
+                    self._correlation_groups[correlation_key] = filtered
+                    return filtered[0]['correlation_id']
+                else:
+                    del self._correlation_groups[correlation_key]
             
-            if self._correlation_groups[correlation_key]:
-                return self._correlation_groups[correlation_key][0]['correlation_id']
-        
-        correlation_id = str(uuid.uuid4())
-        self._correlation_groups.setdefault(correlation_key, []).append({
-            'timestamp': current_time,
-            'correlation_id': correlation_id,
-            'patterns': patterns
-        })
-        
-        return correlation_id
+            correlation_id = str(uuid.uuid4())
+            self._correlation_groups[correlation_key] = [{
+                'timestamp': current_time,
+                'correlation_id': correlation_id,
+                'patterns': patterns
+            }]
+            
+            return correlation_id
     
     def get_window_statistics(self, window_seconds: int = 300) -> WindowStatistics:
+        if window_seconds <= 0:
+            raise ValueError("window_seconds must be positive")
+        
         cutoff = time.time() - window_seconds
         window_events = [e for e in self._event_buffer if e['timestamp'] > cutoff]
         
@@ -442,9 +531,15 @@ class AdvancedLogProcessor:
                     event_counts[pattern] += 1
             
             if event['is_anomaly']:
+                severity = AnomalySeverity.CRITICAL if event['anomaly_score'] > 5 else (
+                    AnomalySeverity.HIGH if event['anomaly_score'] > 4 else (
+                        AnomalySeverity.MEDIUM if event['anomaly_score'] > 3 else AnomalySeverity.LOW
+                    )
+                )
+                
                 window_anomalies.append(AnomalyReport(
                     timestamp=datetime.fromtimestamp(event['timestamp']),
-                    severity=AnomalySeverity.MEDIUM if event['anomaly_score'] > 3 else AnomalySeverity.LOW,
+                    severity=severity,
                     anomaly_type='length_anomaly',
                     description=f"Line length {event['length']} deviates from baseline",
                     context={
@@ -468,45 +563,56 @@ class AdvancedLogProcessor:
         )
     
     def get_anomaly_history(self, limit: int = 100) -> List[AnomalyReport]:
-        return self._anomaly_history[-limit:]
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        
+        with self._lock:
+            return self._anomaly_history[-limit:]
     
     def get_comprehensive_report(self) -> Dict[str, Any]:
-        return {
-            'pattern_statistics': self._pattern_detector.get_pattern_statistics(),
-            'entropy_state': {
-                'current_raw_entropy': self._event_distribution_entropy.entropy,
-                'current_smoothed_entropy': self._smoothed_entropy.entropy,
-                'unique_event_signatures': self._event_distribution_entropy.unique_values,
-                'window_size': self._event_distribution_entropy.window_size
-            },
-            'threshold_baseline': {
-                'mean': self._threshold_monitor.baseline[0],
-                'std': self._threshold_monitor.baseline[1],
-                'calibrated': self._threshold_monitor.calibrated
-            },
-            'temporal_analysis': {
-                'arrival_regularity': self._temporal_analyzer.detect_arrival_regularity(),
-                'trend': self._temporal_analyzer.get_trend()
-            },
-            'correlation_groups': {
-                pattern: len(events) for pattern, events in self._correlation_groups.items()
-            },
-            'total_events_processed': len(self._event_buffer),
-            'total_anomalies_detected': len(self._anomaly_history),
-            'processing_mode': self.processing_mode.value
-        }
+        with self._lock:
+            return {
+                'pattern_statistics': self._pattern_detector.get_pattern_statistics(),
+                'entropy_state': {
+                    'current_raw_entropy': self._event_distribution_entropy.entropy,
+                    'current_smoothed_entropy': self._smoothed_entropy.entropy,
+                    'unique_event_signatures': self._event_distribution_entropy.unique_values,
+                    'window_size': self._event_distribution_entropy.window_size
+                },
+                'threshold_baseline': {
+                    'mean': self._threshold_monitor.baseline[0],
+                    'std': self._threshold_monitor.baseline[1],
+                    'calibrated': self._threshold_monitor.calibrated
+                },
+                'temporal_analysis': {
+                    'arrival_regularity': self._temporal_analyzer.detect_arrival_regularity(),
+                    'trend': self._temporal_analyzer.get_trend()
+                },
+                'correlation_groups': {
+                    pattern: len(events) for pattern, events in self._correlation_groups.items()
+                },
+                'total_events_processed': len(self._event_buffer),
+                'total_anomalies_detected': len(self._anomaly_history),
+                'processing_mode': self.config.processing_mode.value
+            }
     
     def reset(self) -> None:
-        self._event_distribution_entropy.reset()
-        self._smoothed_entropy.reset()
-        self._threshold_monitor.reset()
-        self._event_buffer.clear()
-        self._correlation_groups.clear()
-        self._anomaly_history.clear()
+        with self._lock:
+            self._event_distribution_entropy.reset()
+            self._smoothed_entropy.reset()
+            self._threshold_monitor.reset()
+            self._temporal_analyzer.reset()
+            self._pattern_detector.reset()
+            self._event_buffer.clear()
+            self._correlation_groups.clear()
+            self._anomaly_history.clear()
 
 
 class TimestampSimulator:
     def __init__(self, start_time: float, speed_factor: float = 1.0):
+        if speed_factor <= 0:
+            raise ValueError("speed_factor must be positive")
+        
         self._base_time = start_time
         self._current_time = start_time
         self._speed_factor = speed_factor
@@ -569,6 +675,11 @@ class DataStreamSimulator:
         events_per_second: int = 10,
         timestamp_simulator: Optional[TimestampSimulator] = None
     ) -> Generator[Tuple[float, str], None, None]:
+        if duration_seconds <= 0:
+            raise ValueError("duration_seconds must be positive")
+        if events_per_second <= 0:
+            raise ValueError("events_per_second must be positive")
+        
         start_offset = 0
         end_offset = duration_seconds
         current_offset = 0
@@ -617,6 +728,11 @@ class DataStreamSimulator:
         duration_seconds: int = 30,
         events_per_second: int = 10
     ) -> Generator[Tuple[float, str], None, None]:
+        if duration_seconds <= 0:
+            raise ValueError("duration_seconds must be positive")
+        if events_per_second <= 0:
+            raise ValueError("events_per_second must be positive")
+        
         base_time = 1700000000.0
         event_counter = 0
         
@@ -651,6 +767,9 @@ class DataStreamSimulator:
 
 
 def format_anomaly_report(report: AnomalyReport, max_context_length: int = 300) -> str:
+    if max_context_length <= 0:
+        raise ValueError("max_context_length must be positive")
+    
     context_str = json.dumps(report.context, indent=2)
     if len(context_str) > max_context_length:
         context_str = context_str[:max_context_length] + "..."
@@ -667,11 +786,13 @@ def demonstrate_advanced_processing():
     print("ADVANCED LOG PROCESSING DEMONSTRATION")
     print("=" * 50)
     
-    processor = AdvancedLogProcessor(
+    config = LogProcessorConfig(
         correlation_window_seconds=30,
         event_buffer_size=5000,
         processing_mode=ProcessingMode.HYBRID
     )
+    
+    processor = AdvancedLogProcessor(config=config)
     simulator = DataStreamSimulator()
     timestamp_sim = TimestampSimulator(start_time=1700000000.0, speed_factor=100.0)
     
